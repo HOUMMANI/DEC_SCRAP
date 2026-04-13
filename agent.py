@@ -25,6 +25,10 @@ from decypha.downloader import (
     DATA_SECTIONS,
 )
 from decypha.organizer import organize_directory, print_tree, summary_report
+from decypha.morocco_financials import (
+    run_morocco_financials,
+    print_results as print_morocco_results,
+)
 
 # ── Logging setup ────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -43,31 +47,58 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Download everything (all sections)
-  python agent.py --all
+  # États financiers de TOUTES les entreprises marocaines
+  python agent.py --morocco
 
-  # Download a specific section
+  # États financiers d'une seule entreprise marocaine
+  python agent.py --morocco --filter "Attijariwafa"
+
+  # Tester sur 3 entreprises seulement (avant de tout lancer)
+  python agent.py --morocco --limit 3 --debug
+
+  # Télécharger une section générique
   python agent.py --section financials
 
-  # Download data for a specific company
-  python agent.py --company aramco
+  # Télécharger une URL Decypha spécifique
+  python agent.py --url "https://www.decypha.com/company/attijariwafa/financials"
 
-  # Show what sections are available
-  python agent.py --list-sections
-
-  # Run in headed (visible) browser mode for debugging
-  python agent.py --all --no-headless
+  # Navigateur visible (debug)
+  python agent.py --morocco --no-headless
 """,
     )
 
     # Auth
     auth = p.add_argument_group("Authentication")
-    auth.add_argument("--email", help="Decypha login email (or set DECYPHA_EMAIL in .env)")
+    auth.add_argument("--email", help="Decypha login (or set DECYPHA_EMAIL in .env)")
     auth.add_argument("--password", help="Decypha password (or set DECYPHA_PASSWORD in .env)")
 
-    # Actions
-    action = p.add_argument_group("Download actions")
-    action.add_argument("--all", action="store_true", help="Download from all available sections")
+    # ── Morocco mode (primary use-case) ──────────────────────────────────────
+    morocco = p.add_argument_group("Morocco financial statements (main use-case)")
+    morocco.add_argument(
+        "--morocco",
+        action="store_true",
+        help="Download Income Statement + Balance Sheet + Cash Flow for ALL Moroccan companies",
+    )
+    morocco.add_argument(
+        "--filter",
+        metavar="NAME",
+        help="Only process companies whose name contains NAME (case-insensitive)",
+    )
+    morocco.add_argument(
+        "--limit",
+        metavar="N",
+        type=int,
+        help="Process at most N companies (useful for testing)",
+    )
+    morocco.add_argument(
+        "--debug",
+        action="store_true",
+        help="Save a screenshot at each step for debugging",
+    )
+
+    # ── Generic actions ───────────────────────────────────────────────────────
+    action = p.add_argument_group("Other download actions")
+    action.add_argument("--all", action="store_true", help="Download from all Decypha sections")
     action.add_argument(
         "--section",
         metavar="NAME",
@@ -76,14 +107,18 @@ Examples:
     action.add_argument(
         "--company",
         metavar="ID",
-        help="Download data for a specific company (use Decypha company slug/ID)",
+        help="Download data for a company by Decypha slug/ID",
     )
     action.add_argument(
         "--url",
         metavar="URL",
-        help="Download from a custom Decypha URL",
+        help="Download from any Decypha URL",
     )
-    action.add_argument("--list-sections", action="store_true", help="List available sections and exit")
+    action.add_argument(
+        "--list-sections",
+        action="store_true",
+        help="List available sections and exit",
+    )
 
     # Output
     output = p.add_argument_group("Output")
@@ -91,12 +126,12 @@ Examples:
         "--download-dir",
         default=None,
         metavar="DIR",
-        help="Directory to save downloads (default: ./downloads or DOWNLOAD_DIR in .env)",
+        help="Directory for downloads (default: ./downloads or DOWNLOAD_DIR in .env)",
     )
     output.add_argument(
         "--no-organize",
         action="store_true",
-        help="Skip automatic file organization after download",
+        help="Skip automatic file organisation after download",
     )
     output.add_argument(
         "--no-headless",
@@ -106,25 +141,25 @@ Examples:
     output.add_argument(
         "--tree",
         action="store_true",
-        help="Print download directory tree at the end",
+        help="Print download directory tree when done",
     )
 
     return p
 
 
 def resolve_credentials(args) -> tuple[str, str]:
-    """Get email/password from args, then .env, then prompt."""
+    """Get login/password from args → .env → interactive prompt."""
     email = args.email or os.getenv("DECYPHA_EMAIL") or ""
     password = args.password or os.getenv("DECYPHA_PASSWORD") or ""
 
     if not email:
-        email = input("Decypha email: ").strip()
+        email = input("Decypha login: ").strip()
     if not password:
         import getpass
         password = getpass.getpass("Decypha password: ")
 
     if not email or not password:
-        logger.error("Email and password are required.")
+        logger.error("Login and password are required.")
         sys.exit(1)
 
     return email, password
@@ -158,7 +193,7 @@ def main():
         return
 
     # Require at least one action
-    if not (args.all or args.section or args.company or args.url):
+    if not (args.morocco or args.all or args.section or args.company or args.url):
         parser.print_help()
         sys.exit(0)
 
@@ -170,13 +205,15 @@ def main():
     ).resolve()
     download_dir.mkdir(parents=True, exist_ok=True)
     raw_dir = download_dir / "_raw"
+    browser_path = os.getenv("BROWSER_PATH") or None
 
-    logger.info("Download directory: %s", download_dir)
-    logger.info("Headless browser: %s", headless)
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    logger.info("Download directory : %s", download_dir)
+    logger.info("Headless browser   : %s", headless)
 
     all_files: list[Path] = []
-
-    browser_path = os.getenv("BROWSER_PATH") or None
 
     with sync_playwright() as pw:
         browser, context, page = get_authenticated_page(
@@ -189,13 +226,30 @@ def main():
         )
 
         try:
-            if args.all:
+            # ── Morocco financials (main use-case) ────────────────────────────
+            if args.morocco:
+                morocco_dir = download_dir / "morocco"
+                results = run_morocco_financials(
+                    page,
+                    base_dir=morocco_dir,
+                    debug=args.debug,
+                    max_companies=args.limit,
+                    company_filter=args.filter,
+                )
+                print_morocco_results(results, morocco_dir)
+
+                # Flatten all downloaded paths for the summary below
+                for r in results:
+                    all_files.extend(Path(p) for p in r.downloaded)
+
+            # ── Generic actions ───────────────────────────────────────────────
+            elif args.all:
                 all_files = run_full_download(page, raw_dir)
 
             elif args.section:
                 if args.section not in DATA_SECTIONS:
                     logger.error(
-                        "Unknown section '%s'. Valid sections: %s",
+                        "Unknown section '%s'. Valid: %s",
                         args.section,
                         ", ".join(DATA_SECTIONS),
                     )
@@ -219,13 +273,13 @@ def main():
 
     logger.info("Total files downloaded: %d", len(all_files))
 
-    # Organize files
-    if not args.no_organize and all_files:
-        logger.info("Organizing downloaded files...")
+    # Organise generic downloads (Morocco files are already organised)
+    if not args.morocco and not args.no_organize and all_files:
+        logger.info("Organising downloaded files...")
         organized = organize_directory(raw_dir, download_dir)
-        logger.info("Organized %d file(s).", len(organized))
+        logger.info("Organised %d file(s).", len(organized))
 
-    # Summary
+    # File-type summary
     counts = summary_report(download_dir)
     if counts:
         print("\n--- Download summary ---")
