@@ -205,13 +205,17 @@ def main():
     ).resolve()
     download_dir.mkdir(parents=True, exist_ok=True)
     raw_dir = download_dir / "_raw"
-    browser_path = os.getenv("BROWSER_PATH") or None
+    browser_path   = os.getenv("BROWSER_PATH") or None
+    chrome_profile = os.getenv("CHROME_PROFILE") or None
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
     logger.info("Download directory : %s", download_dir)
-    logger.info("Headless browser   : %s", headless)
+    if chrome_profile:
+        logger.info("Mode               : Chrome profile (session existante)")
+    else:
+        logger.info("Mode               : Login email/password")
 
     all_files: list[Path] = []
 
@@ -223,6 +227,7 @@ def main():
             headless=headless,
             download_dir=str(raw_dir),
             browser_path=browser_path,
+            chrome_profile=chrome_profile,
         )
 
         try:
