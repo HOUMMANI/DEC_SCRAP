@@ -176,6 +176,8 @@ def main():
 
     all_files: list[Path] = []
 
+    browser_path = os.getenv("BROWSER_PATH") or None
+
     with sync_playwright() as pw:
         browser, context, page = get_authenticated_page(
             pw,
@@ -183,6 +185,7 @@ def main():
             password=password,
             headless=headless,
             download_dir=str(raw_dir),
+            browser_path=browser_path,
         )
 
         try:

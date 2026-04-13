@@ -177,17 +177,29 @@ def get_authenticated_page(
     password: str,
     headless: bool = True,
     download_dir: str = "./downloads",
+    browser_path: str | None = None,
 ):
     """
     Launch a browser, restore or create a session, and return
     (browser, context, page) ready for scraping.
+
+    browser_path: optional explicit path to a Chromium/Chrome executable.
+                  If None, Playwright uses its own bundled browser.
+                  Can also be set via BROWSER_PATH env variable.
     """
     Path(download_dir).mkdir(parents=True, exist_ok=True)
 
-    browser = playwright_instance.chromium.launch(
-        headless=headless,
-        args=["--no-sandbox", "--disable-dev-shm-usage"],
-    )
+    exe = browser_path or os.getenv("BROWSER_PATH") or None
+
+    launch_kwargs: dict = {
+        "headless": headless,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+    }
+    if exe:
+        launch_kwargs["executable_path"] = exe
+        logger.info("Using custom browser: %s", exe)
+
+    browser = playwright_instance.chromium.launch(**launch_kwargs)
     context = browser.new_context(
         accept_downloads=True,
         viewport={"width": 1280, "height": 900},
