@@ -1,21 +1,25 @@
 """
 Morocco Financials Downloader
 ==============================
-Scrapes Decypha for all listed Moroccan companies and downloads:
-  - Income Statement (Compte de résultat)
-  - Balance Sheet   (Bilan)
-  - Cash Flow       (Flux de trésorerie)
+Télécharge pour chaque entreprise cotée à la BVC (Bourse de Casablanca) :
+  - Income Statement  (Compte de résultat / CPC)
+  - Balance Sheet     (Bilan)
+  - Cash Flow         (Flux de trésorerie)
 
-Each company gets its own folder:
-  downloads/morocco/{company_name}/
-    ├── income_statement.xlsx
-    ├── balance_sheet.xlsx
-    └── cash_flow.xlsx
+URL pattern Decypha :
+  https://www.decypha.com/en/financial/snp/cse/{TICKER}?viewType=&currency=MAD
+
+Structure de sortie :
+  downloads/morocco/{TICKER}_{NOM}/
+      income_statement.xlsx  (ou .csv si pas de bouton export)
+      balance_sheet.xlsx
+      cash_flow.xlsx
 """
 
 import re
 import time
 import logging
+import csv
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -23,37 +27,143 @@ from playwright.sync_api import Page
 
 logger = logging.getLogger(__name__)
 
-DECYPHA_URL = "https://www.decypha.com"
+BASE_URL = "https://www.decypha.com"
 
-# ── URL patterns to try for the Moroccan company list ────────────────────────
-MOROCCO_SCREENER_URLS = [
-    f"{DECYPHA_URL}/screener?country=Morocco",
-    f"{DECYPHA_URL}/screener?country=MA",
-    f"{DECYPHA_URL}/screener?exchange=CSE",
-    f"{DECYPHA_URL}/screener?exchange=BVC",
-    f"{DECYPHA_URL}/screener?market=Morocco",
-    f"{DECYPHA_URL}/companies?country=Morocco",
-    f"{DECYPHA_URL}/companies?exchange=CSE",
-    f"{DECYPHA_URL}/market-data/equities?country=Morocco",
-    f"{DECYPHA_URL}/equities?country=MA",
+# ── Liste complète des entreprises cotées à la BVC (Casablanca Stock Exchange) ──
+# Format : (TICKER, NOM)
+CSE_COMPANIES = [
+    ("ADH",        "Douja Prom Addoha"),
+    ("AFM",        "Afma"),
+    ("AFI",        "Africa Industries"),
+    ("AGMA",       "Agma Lahlou-Tazi"),
+    ("ADI",        "Alliances Développement Immobilier"),
+    ("ALU",        "Aluminium du Maroc"),
+    ("AKT",        "Akdital"),
+    ("ARADEI",     "Aradei Capital"),
+    ("ATH",        "Auto Hall"),
+    ("ATW",        "Attijariwafa Bank"),
+    ("BAL",        "Balima"),
+    ("BCP",        "Banque Centrale Populaire"),
+    ("BMCE",       "Bank of Africa"),
+    ("BMCI",       "BMCI"),
+    ("BOA",        "Bank of Africa"),
+    ("BVC",        "Bourse de Casablanca"),
+    ("CAM",        "Crédit Agricole du Maroc"),
+    ("CDM",        "Crédit du Maroc"),
+    ("CFG",        "CFG Bank"),
+    ("CGI",        "Colorado Group Immobilier"),
+    ("CIH",        "CIH Bank"),
+    ("CMT",        "Compagnie Minière de Touissit"),
+    ("CMA",        "Ciments du Maroc"),
+    ("CNIA",       "CNIA Saada Assurance"),
+    ("CO",         "Colorado"),
+    ("COL",        "Colorado"),
+    ("CSR",        "Cosumar"),
+    ("CTM",        "CTM"),
+    ("DAR",        "Dari Couspate"),
+    ("DLT",        "Delta Holding"),
+    ("DIS",        "Disway"),
+    ("DWY",        "Disway"),
+    ("EQD",        "Eqdom"),
+    ("FBR",        "Fenie Brossette"),
+    ("FEN",        "Fenie Brossette"),
+    ("FER",        "Fertima"),
+    ("GAZ",        "Afriquia Gaz"),
+    ("HPS",        "Hightech Payment Systems"),
+    ("IAM",        "Maroc Telecom"),
+    ("IB",         "IB Maroc"),
+    ("IMR",        "Immorente Invest"),
+    ("INV",        "Involys"),
+    ("JLEC",       "Jorf Lasfar Energy Company"),
+    ("LBV",        "Label Vie"),
+    ("LES",        "Lesieur Cristal"),
+    ("LHM",        "Lafarge Holcim Maroc"),
+    ("LYD",        "Lydec"),
+    ("M2M",        "M2M Group"),
+    ("MAB",        "Maghrebail"),
+    ("MAN",        "Managem"),
+    ("MDP",        "Med Paper"),
+    ("MNG",        "Managem"),
+    ("MOX",        "Maghreb Oxygène"),
+    ("MUT",        "Mutandis"),
+    ("NEX",        "Nexans Maroc"),
+    ("OUL",        "Les Eaux Minérales d'Oulmès"),
+    ("PAL",        "Palmeraie Développement"),
+    ("PRO",        "Promopharm"),
+    ("RDS",        "Résidences Dar Saada"),
+    ("REB",        "Rebab Company"),
+    ("RIS",        "Risma"),
+    ("SAF",        "Salafin"),
+    ("SAH",        "Saham Finances"),
+    ("SAM",        "SAMIR"),
+    ("SCE",        "Sonasid"),
+    ("SMI",        "Société Métallurgique d'Imiter"),
+    ("SNA",        "Snep"),
+    ("SOT",        "Sothema"),
+    ("STR",        "Stroc Industrie"),
+    ("TAQ",        "TAQA Morocco"),
+    ("TAQA",       "TAQA Morocco"),
+    ("TGC",        "TGCC"),
+    ("TGCC",       "TGCC"),
+    ("TIM",        "Timar"),
+    ("TQM",        "TotalEnergies Marketing Maroc"),
+    ("UNI",        "UNIM"),
+    ("WAA",        "Wafa Assurance"),
+    ("ZDJ",        "Zellidja"),
 ]
 
-# ── Financial statement tab labels (EN + FR) ─────────────────────────────────
-STATEMENT_TABS = {
-    "income_statement": [
-        "Income Statement", "P&L", "Profit & Loss",
-        "Compte de résultat", "Résultats", "CPC",
-    ],
-    "balance_sheet": [
-        "Balance Sheet", "Bilan",
-    ],
-    "cash_flow": [
-        "Cash Flow", "Cash Flow Statement",
-        "Flux de trésorerie", "Tableau de flux",
-    ],
+# Dédoublonnage par ticker
+_seen_tickers: set[str] = set()
+CSE_COMPANIES_UNIQUE: list[tuple[str, str]] = []
+for _t, _n in CSE_COMPANIES:
+    if _t not in _seen_tickers:
+        _seen_tickers.add(_t)
+        CSE_COMPANIES_UNIQUE.append((_t, _n))
+CSE_COMPANIES = CSE_COMPANIES_UNIQUE
+
+
+# ── URL builders ──────────────────────────────────────────────────────────────
+def financial_url(ticker: str, view_type: str = "") -> str:
+    """
+    Build the Decypha financial URL for a given ticker.
+    view_type : "", "IS", "BS", "CF" (Income Statement, Balance Sheet, Cash Flow)
+    """
+    return (
+        f"{BASE_URL}/en/financial/snp/cse/{ticker}"
+        f"?viewType={view_type}&currency=MAD&fromPeriod=&toPeriod="
+    )
+
+
+# ── Tab labels for each statement (EN + FR + Decypha-specific) ────────────────
+STATEMENT_CONFIG = {
+    "income_statement": {
+        "view_type": "IS",          # essayé dans l'URL
+        "tab_labels": [
+            "Income Statement", "P&L", "Profit & Loss",
+            "Compte de résultat", "Résultats", "CPC",
+            "IS", "Income",
+        ],
+        "filename": "income_statement",
+    },
+    "balance_sheet": {
+        "view_type": "BS",
+        "tab_labels": [
+            "Balance Sheet", "Bilan", "BS",
+        ],
+        "filename": "balance_sheet",
+    },
+    "cash_flow": {
+        "view_type": "CF",
+        "tab_labels": [
+            "Cash Flow", "Cash Flow Statement",
+            "Flux de trésorerie", "Tableau de flux",
+            "CF", "Cash",
+        ],
+        "filename": "cash_flow",
+    },
 }
 
-# ── Selectors for export/download buttons ────────────────────────────────────
+# ── Export / download button selectors ───────────────────────────────────────
 EXPORT_SELECTORS = [
     "button:has-text('Export')",
     "button:has-text('Download')",
@@ -70,201 +180,101 @@ EXPORT_SELECTORS = [
     "[aria-label*='download' i]",
     "button[class*='export' i]",
     "button[class*='download' i]",
-    "i[class*='download']",   # icon-only buttons
+    "i.fa-download",
+    "span.fa-download",
+    "button:has(i.fa-download)",
+    "button:has(svg[data-icon='download'])",
 ]
 
 
 @dataclass
-class Company:
+class CompanyResult:
+    ticker: str
     name: str
-    url: str
-    ticker: str = ""
     downloaded: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
 def _safe_name(text: str) -> str:
-    """Sanitise a string for use as a directory/filename."""
     return re.sub(r'[<>:"/\\|?*\s]+', "_", text).strip("._")
 
 
 def _snap(page: Page, dest_dir: Path, label: str) -> None:
-    """Save a debug screenshot (only when debug dir exists)."""
-    dbg = dest_dir / "_debug"
-    dbg.mkdir(parents=True, exist_ok=True)
-    path = dbg / f"{label}.png"
+    """Save a debug screenshot."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
     try:
-        page.screenshot(path=str(path), full_page=True)
-        logger.debug("Screenshot saved: %s", path)
+        page.screenshot(path=str(dest_dir / f"{label}.png"), full_page=True)
     except Exception:
         pass
 
 
-# ── Company list discovery ────────────────────────────────────────────────────
+# ── Download helpers ──────────────────────────────────────────────────────────
 
-def _find_company_links(page: Page) -> list[dict]:
-    """
-    Generic approach: look for <a> tags that seem to be company links
-    (contain a ticker + name pattern, or go to /company/{slug}).
-    """
-    companies = []
-    seen = set()
-
-    # Pattern 1: links going to /company/...
-    for link in page.locator("a[href*='/company/']").all():
-        href = link.get_attribute("href") or ""
-        text = link.inner_text().strip()
-        if not href or href in seen:
-            continue
-        seen.add(href)
-        full = href if href.startswith("http") else f"{DECYPHA_URL}{href}"
-        companies.append({"name": text or href.split("/")[-1], "url": full})
-
-    # Pattern 2: table rows where each row = one company
-    for row in page.locator("table tbody tr").all():
-        cells = row.locator("td").all()
-        link_el = row.locator("a").first
-        href = link_el.get_attribute("href") if link_el.count() else ""
-        if not href or href in seen:
-            continue
-        seen.add(href)
-        name = link_el.inner_text().strip() or (cells[0].inner_text().strip() if cells else "")
-        full = href if href.startswith("http") else f"{DECYPHA_URL}{href}"
-        companies.append({"name": name, "url": full})
-
-    logger.info("Found %d company links on this page", len(companies))
-    return companies
-
-
-def _scroll_load_all(page: Page, pause: float = 1.5, max_scrolls: int = 20) -> None:
-    """Scroll to bottom repeatedly to trigger lazy-loaded content."""
-    prev_height = 0
-    for _ in range(max_scrolls):
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(pause)
-        new_height = page.evaluate("document.body.scrollHeight")
-        if new_height == prev_height:
-            break
-        prev_height = new_height
-
-
-def _try_load_more(page: Page) -> bool:
-    """Click 'Load more' / 'Next page' buttons. Returns True if clicked."""
-    for sel in [
-        "button:has-text('Load more')",
-        "button:has-text('Show more')",
-        "a:has-text('Next')",
-        "button:has-text('Next')",
-        "[aria-label='Next page']",
-        "li.next a",
-        ".pagination .next a",
-    ]:
-        loc = page.locator(sel).first
-        if loc.count() > 0 and loc.is_visible():
+def _try_export_button(page: Page, dest_dir: Path, stem: str) -> Path | None:
+    """Click the first visible export button and capture the download."""
+    for sel in EXPORT_SELECTORS:
+        locs = page.locator(sel).all()
+        for loc in locs:
+            if not loc.is_visible():
+                continue
             try:
-                loc.click()
-                page.wait_for_load_state("networkidle", timeout=10_000)
-                return True
-            except Exception:
-                pass
-    return False
+                with page.expect_download(timeout=15_000) as dl_info:
+                    loc.click()
+                dl = dl_info.value
+                ext = Path(dl.suggested_filename or "data.xlsx").suffix or ".xlsx"
+                dest = dest_dir / f"{stem}{ext}"
+                dl.save_as(str(dest))
+                logger.info("    Exported: %s", dest.name)
+                return dest
+            except Exception as exc:
+                logger.debug("    Export selector %s failed: %s", sel, exc)
+    return None
 
 
-def discover_moroccan_companies(page: Page, debug_dir: Path | None = None) -> list[Company]:
+def _scrape_table_to_csv(page: Page, dest_dir: Path, stem: str) -> Path | None:
     """
-    Navigate to the Decypha screener / company list filtered for Morocco
-    and return a list of Company objects.
+    Fallback: scrape the largest visible HTML table and save as CSV.
     """
-    companies: list[Company] = []
-
-    for url in MOROCCO_SCREENER_URLS:
-        logger.info("Trying screener URL: %s", url)
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-            time.sleep(2)
-
-            if debug_dir:
-                _snap(page, debug_dir, f"screener_{url.split('=')[-1]}")
-
-            # Try to apply Morocco filter if it's a generic screener
-            _try_apply_morocco_filter(page)
-
-            # Collect all companies (with scroll + pagination)
-            page_companies: list[dict] = []
-            _scroll_load_all(page)
-            page_companies.extend(_find_company_links(page))
-
-            while _try_load_more(page):
-                time.sleep(1)
-                _scroll_load_all(page, pause=0.8, max_scrolls=5)
-                page_companies.extend(_find_company_links(page))
-
-            if page_companies:
-                seen = set()
-                for c in page_companies:
-                    if c["url"] not in seen:
-                        seen.add(c["url"])
-                        companies.append(Company(name=c["name"], url=c["url"]))
-                logger.info("Total companies found via %s: %d", url, len(companies))
-                break  # stop trying URLs once we got results
-        except Exception as exc:
-            logger.debug("Screener URL %s failed: %s", url, exc)
-            continue
-
-    if not companies:
-        logger.warning(
-            "Could not discover companies automatically. "
-            "Try running with --debug and check the screenshots."
-        )
-
-    return companies
-
-
-def _try_apply_morocco_filter(page: Page) -> None:
-    """
-    If we landed on a generic screener, try to apply a 'Morocco' country filter.
-    """
-    filter_selectors = [
-        ("select[name*='country' i]",   "Morocco"),
-        ("select[id*='country' i]",     "Morocco"),
-        ("input[placeholder*='country' i]", "Morocco"),
-        ("input[placeholder*='market' i]",  "Morocco"),
-    ]
-    for sel, value in filter_selectors:
-        loc = page.locator(sel).first
-        if loc.count() > 0:
-            try:
-                loc.select_option(label=value)
-                time.sleep(1)
-                logger.debug("Applied Morocco filter via: %s", sel)
+    tables = page.locator("table").all()
+    if not tables:
+        # Try common data container selectors
+        for container_sel in [
+            "[class*='financial-table']",
+            "[class*='data-table']",
+            "[class*='statement']",
+            ".table-responsive table",
+        ]:
+            tables = page.locator(container_sel + " table, " + container_sel).all()
+            if tables:
                 break
-            except Exception:
-                try:
-                    loc.fill(value)
-                    page.keyboard.press("Enter")
-                    time.sleep(1)
-                    logger.debug("Typed Morocco filter via: %s", sel)
-                    break
-                except Exception:
-                    pass
 
-    # Click-based filter buttons
-    for btn_text in ["Morocco", "Maroc", "MA"]:
-        btn = page.locator(f"button:has-text('{btn_text}'), a:has-text('{btn_text}')").first
-        if btn.count() > 0:
-            try:
-                btn.click()
-                time.sleep(1)
-                logger.debug("Clicked filter button: %s", btn_text)
-                break
-            except Exception:
-                pass
+    if not tables:
+        return None
+
+    # Take the table with the most rows
+    best = max(tables, key=lambda t: t.locator("tr").count())
+    rows = best.locator("tr").all()
+    if not rows:
+        return None
+
+    data = []
+    for row in rows:
+        cells = row.locator("th, td").all()
+        data.append([c.inner_text().strip() for c in cells])
+
+    if len(data) < 2:  # empty or header-only
+        return None
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{stem}.csv"
+    with open(dest, "w", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f).writerows(data)
+    logger.info("    Scraped table -> %s", dest.name)
+    return dest
 
 
-# ── Per-company financial download ───────────────────────────────────────────
-
-def _click_financial_tab(page: Page, tab_name: str, labels: list[str]) -> bool:
-    """Click a financial tab by trying multiple label variants. Returns True on success."""
+def _click_tab(page: Page, labels: list[str]) -> bool:
+    """Try clicking a tab by label text. Returns True if clicked."""
     for label in labels:
         for sel in [
             f"button:has-text('{label}')",
@@ -272,168 +282,105 @@ def _click_financial_tab(page: Page, tab_name: str, labels: list[str]) -> bool:
             f"[role='tab']:has-text('{label}')",
             f"li:has-text('{label}')",
             f"span:has-text('{label}')",
+            f"div[class*='tab']:has-text('{label}')",
+            f"[class*='nav-item']:has-text('{label}')",
         ]:
             loc = page.locator(sel).first
             if loc.count() > 0 and loc.is_visible():
                 try:
                     loc.click()
                     time.sleep(1.5)
-                    logger.debug("Clicked tab '%s' via: %s", label, sel)
+                    logger.debug("    Clicked tab: %s", label)
                     return True
                 except Exception:
                     pass
-    logger.debug("Tab '%s' not found on page", tab_name)
     return False
 
 
-def _try_download_button(page: Page, dest_dir: Path, filename_stem: str) -> Path | None:
-    """
-    Try to click an export/download button and capture the resulting file.
-    Returns the saved Path or None if no download occurred.
-    """
-    for sel in EXPORT_SELECTORS:
-        loc = page.locator(sel).first
-        if loc.count() == 0 or not loc.is_visible():
-            continue
-        try:
-            with page.expect_download(timeout=15_000) as dl_info:
-                loc.click()
-            dl = dl_info.value
-            ext = Path(dl.suggested_filename or "data.xlsx").suffix or ".xlsx"
-            dest = dest_dir / f"{filename_stem}{ext}"
-            dl.save_as(str(dest))
-            logger.info("  Downloaded: %s", dest.name)
-            return dest
-        except Exception as exc:
-            logger.debug("Export button %s failed: %s", sel, exc)
-    return None
-
-
-def _scrape_table_to_csv(page: Page, dest_dir: Path, filename_stem: str) -> Path | None:
-    """
-    Fallback: if no download button, scrape the visible HTML table
-    and save it as CSV.
-    """
-    tables = page.locator("table").all()
-    if not tables:
-        logger.debug("No table found on page for %s", filename_stem)
-        return None
-
-    # Use the largest table (most rows)
-    best = max(tables, key=lambda t: t.locator("tr").count())
-    rows = best.locator("tr").all()
-
-    data = []
-    for row in rows:
-        cells = row.locator("th, td").all()
-        data.append([c.inner_text().strip() for c in cells])
-
-    if not data:
-        return None
-
-    dest = dest_dir / f"{filename_stem}.csv"
-    import csv
-    with open(dest, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerows(data)
-    logger.info("  Scraped table -> %s", dest.name)
-    return dest
-
-
-def _navigate_to_financials(page: Page, company_url: str) -> bool:
-    """
-    Given a company URL, navigate to its financials section.
-    Returns True if we found a financials page.
-    """
-    # Try direct /financials sub-paths first
-    financial_paths = [
-        "/financials",
-        "/financial-statements",
-        "/financials/income-statement",
-        "/statements",
-    ]
-    base = company_url.rstrip("/")
-    for path in financial_paths:
-        url = base + path
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-            time.sleep(1.5)
-            if page.url != company_url and "/login" not in page.url:
-                logger.debug("Financials found at: %s", page.url)
-                return True
-        except Exception:
-            pass
-
-    # Fall back: visit base company URL and look for a Financials link/tab
-    page.goto(company_url, wait_until="domcontentloaded", timeout=20_000)
-    time.sleep(2)
-    for label in ["Financials", "Financial Statements", "États financiers", "Données financières"]:
-        for sel in [
-            f"a:has-text('{label}')",
-            f"button:has-text('{label}')",
-            f"[role='tab']:has-text('{label}')",
-        ]:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                loc.click()
-                time.sleep(2)
-                return True
-
-    return False  # couldn't find financials
-
+# ── Per-company downloader ────────────────────────────────────────────────────
 
 def download_company_financials(
     page: Page,
-    company: Company,
+    ticker: str,
+    company_name: str,
     base_dir: Path,
     debug: bool = False,
-) -> Company:
+) -> CompanyResult:
     """
-    For one company, download Balance Sheet, Income Statement, Cash Flow.
-    Saves files in base_dir/{safe_company_name}/.
+    Download all 3 financial statements for one company.
+    Strategy:
+      1. Navigate to the base financial page (viewType=)
+      2. For each statement: try URL with viewType param first,
+         then try clicking the tab,
+         then try export button,
+         then fall back to table scraping.
     """
-    safe = _safe_name(company.name) or _safe_name(company.url.split("/")[-1])
-    dest_dir = base_dir / safe
+    result = CompanyResult(ticker=ticker, name=company_name)
+    folder = _safe_name(f"{ticker}_{company_name}")
+    dest_dir = base_dir / folder
     dest_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("── %s ─────────────────────────────────", company.name)
 
-    # Navigate to financials
-    found = _navigate_to_financials(page, company.url)
-    if not found:
-        msg = f"Could not reach financials page for {company.name}"
-        logger.warning(msg)
-        company.errors.append(msg)
-        return company
+    logger.info("── [%s] %s", ticker, company_name)
+
+    # Load the base page first to confirm the company exists
+    base_page_url = financial_url(ticker)
+    try:
+        page.goto(base_page_url, wait_until="domcontentloaded", timeout=25_000)
+        time.sleep(2)
+    except Exception as exc:
+        result.errors.append(f"Cannot load page: {exc}")
+        logger.warning("    Cannot load: %s", exc)
+        return result
+
+    if "/login" in page.url or "/signin" in page.url:
+        result.errors.append("Session expired - redirected to login")
+        logger.error("    Session expired!")
+        return result
 
     if debug:
-        _snap(page, dest_dir, "00_financials_landing")
+        _snap(page, dest_dir / "_debug", "00_base")
 
-    # Download each statement type
-    for stmt_key, labels in STATEMENT_TABS.items():
-        # Click the right tab
-        tab_found = _click_financial_tab(page, stmt_key, labels)
-        if not tab_found and stmt_key != "income_statement":
-            # Income statement might already be visible by default
-            logger.debug("Tab for %s not found, skipping tab click", stmt_key)
+    # ── Download each statement ───────────────────────────────────────────────
+    for stmt_key, cfg in STATEMENT_CONFIG.items():
+        logger.info("  -> %s", stmt_key)
+        stem = cfg["filename"]
+        got_file: Path | None = None
 
-        if debug:
-            _snap(page, dest_dir, f"01_{stmt_key}_tab")
+        # Strategy A: navigate directly with viewType in URL
+        url_with_type = financial_url(ticker, cfg["view_type"])
+        try:
+            page.goto(url_with_type, wait_until="domcontentloaded", timeout=20_000)
+            time.sleep(2)
+            if debug:
+                _snap(page, dest_dir / "_debug", f"01_{stmt_key}_url")
+        except Exception:
+            # Fall back to base page + tab click
+            page.goto(base_page_url, wait_until="domcontentloaded", timeout=20_000)
+            time.sleep(2)
 
-        # Try to download; fall back to scraping table
-        path = _try_download_button(page, dest_dir, stmt_key)
-        if not path:
-            path = _scrape_table_to_csv(page, dest_dir, stmt_key)
+        # Strategy B: click the tab if URL param didn't switch the view
+        if not got_file:
+            _click_tab(page, cfg["tab_labels"])
+            if debug:
+                _snap(page, dest_dir / "_debug", f"02_{stmt_key}_tab")
 
-        if path:
-            company.downloaded.append(str(path))
+        # Strategy C: click export button → file download
+        got_file = _try_export_button(page, dest_dir, stem)
+
+        # Strategy D: scrape the HTML table
+        if not got_file:
+            got_file = _scrape_table_to_csv(page, dest_dir, stem)
+
+        if got_file:
+            result.downloaded.append(str(got_file))
         else:
-            msg = f"No data for {stmt_key}"
-            logger.warning("  %s: %s", company.name, msg)
-            company.errors.append(msg)
+            msg = f"No data found for {stmt_key}"
+            result.errors.append(msg)
+            logger.warning("    %s", msg)
 
-        time.sleep(0.5)
+        time.sleep(0.8)
 
-    return company
+    return result
 
 
 # ── Main orchestrator ─────────────────────────────────────────────────────────
@@ -444,72 +391,77 @@ def run_morocco_financials(
     debug: bool = False,
     max_companies: int | None = None,
     company_filter: str | None = None,
-) -> list[Company]:
+) -> list[CompanyResult]:
     """
-    Full pipeline:
-      1. Discover all Moroccan listed companies
-      2. For each: download Income Statement, Balance Sheet, Cash Flow
-      3. Return results with download paths and errors
+    Full pipeline: iterate over all CSE companies and download their
+    Income Statement, Balance Sheet and Cash Flow statements.
 
     Args:
         page:           Authenticated Playwright page
-        base_dir:       Root download directory (downloads/morocco/)
+        base_dir:       Root output directory (e.g. downloads/morocco/)
         debug:          Save screenshots at each step
-        max_companies:  Limit to N companies (useful for testing)
-        company_filter: Only process companies whose name contains this string
+        max_companies:  Cap the number of companies (for test runs)
+        company_filter: Only process companies whose ticker or name contains this string
     """
     base_dir.mkdir(parents=True, exist_ok=True)
-    debug_dir = base_dir / "_debug" if debug else None
 
-    logger.info("=== STEP 1: Discovering Moroccan companies ===")
-    companies = discover_moroccan_companies(page, debug_dir=debug_dir)
-
-    if not companies:
-        logger.error("No companies found. Check screenshots in %s", debug_dir)
-        return []
+    companies = list(CSE_COMPANIES)
 
     # Apply filters
     if company_filter:
-        companies = [c for c in companies if company_filter.lower() in c.name.lower()]
-        logger.info("Filter '%s': %d companies remaining", company_filter, len(companies))
+        f = company_filter.upper()
+        companies = [
+            (t, n) for t, n in companies
+            if f in t.upper() or f in n.upper()
+        ]
+        logger.info("Filter '%s': %d companies", company_filter, len(companies))
 
     if max_companies:
         companies = companies[:max_companies]
-        logger.info("Limited to first %d companies", max_companies)
 
-    logger.info("=== STEP 2: Downloading financials for %d companies ===", len(companies))
+    logger.info("=== Starting Morocco Financials: %d companies ===", len(companies))
 
     results = []
-    for i, company in enumerate(companies, 1):
-        logger.info("[%d/%d] Processing: %s", i, len(companies), company.name)
+    for i, (ticker, name) in enumerate(companies, 1):
+        logger.info("[%d/%d] %s - %s", i, len(companies), ticker, name)
         try:
-            company = download_company_financials(page, company, base_dir, debug=debug)
+            result = download_company_financials(
+                page, ticker, name, base_dir, debug=debug
+            )
         except Exception as exc:
-            company.errors.append(f"Unexpected error: {exc}")
-            logger.error("  Error processing %s: %s", company.name, exc)
-        results.append(company)
-        time.sleep(1)  # be polite to the server
+            result = CompanyResult(ticker=ticker, name=name)
+            result.errors.append(f"Unexpected error: {exc}")
+            logger.error("  Unexpected error for %s: %s", ticker, exc)
+        results.append(result)
+        time.sleep(1)
 
     return results
 
 
-def print_results(results: list[Company], base_dir: Path) -> None:
-    """Print a summary table of what was downloaded."""
-    total_files = sum(len(c.downloaded) for c in results)
-    total_errors = sum(len(c.errors) for c in results)
+def print_results(results: list[CompanyResult], base_dir: Path) -> None:
+    """Print a formatted summary."""
+    total_files  = sum(len(r.downloaded) for r in results)
+    total_errors = sum(len(r.errors) for r in results)
+    ok_count     = sum(1 for r in results if r.downloaded and not r.errors)
 
-    print(f"\n{'═' * 60}")
-    print(f"  MOROCCO FINANCIALS - DOWNLOAD SUMMARY")
-    print(f"{'═' * 60}")
-    print(f"  Companies processed : {len(results)}")
-    print(f"  Files downloaded    : {total_files}")
-    print(f"  Errors              : {total_errors}")
-    print(f"  Output directory    : {base_dir}")
-    print(f"{'─' * 60}")
+    print(f"\n{'═' * 65}")
+    print("  MOROCCO FINANCIALS — RÉSULTAT")
+    print(f"{'═' * 65}")
+    print(f"  Entreprises traitées : {len(results)}")
+    print(f"  OK (≥1 fichier)      : {ok_count}")
+    print(f"  Fichiers téléchargés : {total_files}")
+    print(f"  Erreurs              : {total_errors}")
+    print(f"  Dossier de sortie    : {base_dir}")
+    print(f"{'─' * 65}")
 
-    for c in results:
-        status = "OK " if c.downloaded and not c.errors else ("ERR" if c.errors else "---")
-        files = ", ".join(Path(p).name for p in c.downloaded) or "none"
-        print(f"  [{status}] {c.name:<35} {files}")
+    for r in results:
+        if r.downloaded and not r.errors:
+            status = "OK "
+        elif r.downloaded:
+            status = "PAR"   # partial
+        else:
+            status = "ERR"
+        files = ", ".join(Path(p).name for p in r.downloaded) or "—"
+        print(f"  [{status}] {r.ticker:<8} {r.name:<35} {files}")
 
-    print(f"{'═' * 60}\n")
+    print(f"{'═' * 65}\n")
